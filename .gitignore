@@ -1,0 +1,18 @@
+# Python virtual environment
+tesseract-ocr/
+__pycache__/
+
+# Dataset + model weights (too big for GitHub; get them from Kaggle)
+SROIE2019/
+
+# Generated outputs
+output/
+results/
+sample_receipt.png
+
+# Personal notes and scratch scripts (kept locally)
+ocr-project-notes.md
+make_sample.py
+
+# Claude Code local settings
+.claude/
