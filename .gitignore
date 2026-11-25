@@ -16,3 +16,6 @@ make_sample.py
 
 # Claude Code local settings
 .claude/
+
+# Separate VLM experiment repo (pushed to github.com/ceciliasx/sroie-vlm)
+sroie-vlm/
