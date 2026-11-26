@@ -49,22 +49,25 @@ def find_date(lines):
     """First valid date on the receipt, top to bottom."""
     for line in lines:
         for kind, pattern in enumerate(DATE_PATTERNS):
-            for m in pattern.finditer(line):
+            pos = 0
+            while (m := pattern.search(line, pos)):
                 if is_valid_date(kind, m):
                     text = m.group(0)
                     return re.sub(r"\s", "", text) if kind < 2 else text.upper()
+                pos = m.start() + 1      # rejected: retry one character later, not after the match
     return ""
 
 
 # ---------- total ----------
 
-AMOUNT = re.compile(r"\d{1,3}(?:,\d{3})+\.\d{2}(?!\d)|\d+[.,]\d{2}(?!\d)")
+AMOUNT = re.compile(r"\d{1,3}(?:,\d{3})+\.\d{2}(?!\d)|\d+[.,] ?\d{2}(?!\d)")   # also "140. 65"
 TOTAL_WORD = re.compile(r"T[O0]TA[L1I]", re.IGNORECASE)          # also catches OCR slips like T0TAL
 NOT_TOTAL = re.compile(r"SUB\s*-?\s*T[O0]TA|QTY|QUANTITY", re.IGNORECASE)
-
+PAYMENT = re.compile(r"CASH|CHANGE|TENDER|PAID|CARD|VISA|MASTER", re.IGNORECASE)
 
 def to_number(text):
-    """'1,234.50' -> 1234.5, and '0,20' (OCR read the dot as a comma) -> 0.2"""
+    """'1,234.50' -> 1234.5, '0,20' -> 0.2, '140. 65' -> 140.65"""
+    text = text.replace(" ", "")
     if re.fullmatch(r"\d+,\d{2}", text):
         text = text.replace(",", ".")
     return float(text.replace(",", ""))
@@ -80,17 +83,20 @@ def find_total(lines):
                 amounts = AMOUNT.findall(lines[i + 1])
             if amounts:
                 candidates.append(to_number(amounts[-1]))
-    if not candidates:                                # fallback: biggest amount anywhere
-        candidates = [to_number(a) for line in lines for a in AMOUNT.findall(line)]
+    if not candidates:   # fallback: biggest amount, but not cash handed over or change
+        candidates = [to_number(a) for line in lines if not PAYMENT.search(line)
+                      for a in AMOUNT.findall(line)]
     return f"{max(candidates):.2f}" if candidates else ""
 
 
 # ---------- company ----------
 
 COMPANY_HINT = re.compile(
-    r"SDN\.?\s*BHD|S/B|\bBHD\b|\bBERHAD\b|ENTERPRISE|TRADING|RESTORAN|RESTAURANT|"
+    r"SDN\.?\s*BHD|S/B|\bSB\b|\bBHD\b|\bBERHAD\b|ENTERPRISE|TRADING|RESTORAN|RESTAURANT|"
+    r"PERNIAGAAN|SYARIKAT|KEDAI|"
     r"\bMART\b|\bSTORE\b|HARDWARE|\bCAFE\b|BAKERY|PHARMACY|\bLTD\b|\bPLT\b",
     re.IGNORECASE)
+SUFFIX_ONLY = re.compile(r"^\W*(SDN\.?\s*BHD|S/B|BHD|BERHAD)\W*$", re.IGNORECASE)
 SKIP_LINE = re.compile(r"INVOICE|RECEIPT|\bCOPY\b|WELCOME|\bGST\b|\bTEL\b|\bFAX\b", re.IGNORECASE)
 REG_NO_TAIL = re.compile(r"\s*\(?\s*\d{4,}\s*-+\s*[A-Z]\s*\)?.*$")   # "(640899-P)" and anything after
 
@@ -108,17 +114,17 @@ def looks_like_name(text):
 def find_company(lines, top=8):
     """Returns (company, line index). Looks only at the top of the receipt."""
     head = lines[:top]
-    # 1) a line with a company-type word (SDN BHD, RESTORAN, ...)
+    # 1) a line with a company-type word (SDN BHD, RESTORAN, PERNIAGAAN, ...)
     for i, line in enumerate(head):
         if COMPANY_HINT.search(line):
             # name split over two lines: "MR. D.I.Y. (KUCHAI)" / "SDN BHD"
-            if i > 0 and len(line.split()) <= 2 and looks_like_name(head[i - 1]):
+            if i > 0 and SUFFIX_ONLY.match(clean_company(line)) and looks_like_name(head[i - 1]):
                 return clean_company(head[i - 1] + " " + line), i
             return clean_company(line), i
-    # 2) otherwise the first line that looks like a name
+    # 2) otherwise the first line that looks like a name (2+ words, so junk like "hare" is skipped)
     for i, line in enumerate(head):
         name = clean_company(line)
-        if looks_like_name(name) and not SKIP_LINE.search(line):
+        if looks_like_name(name) and len(name.split()) >= 2 and not SKIP_LINE.search(line):
             return name, i
     return "", -1
 
@@ -126,21 +132,23 @@ def find_company(lines, top=8):
 # ---------- address ----------
 
 ADDRESS_STOP = re.compile(
-    r"\bTEL\b|\bT\s*:|\bFAX\b|\bF\s*:|PHONE|H/P|E-?MAIL|WWW|HTTP|\bGST\b|INVOICE|RECEIPT|"
-    r"\bDATE\b|CASHIER", re.IGNORECASE)
+    r"\bTEL\b|\bT\s*:|\bFAX\b|\bF\s*:|PHONE|H/P|E-?MAIL|WWW|HTTP|\bGST|INVOICE|RECEIPT|"
+    r"\bDATE\b|CASHIER|\b0\d{1,2}\s?-\s?\d{3,4}\s?\d{4}\b",     # last part = phone numbers
+    re.IGNORECASE)
 REG_LINE = re.compile(r"\d{4,}\s*-+\s*[A-Z]\b|\bROC\b|CO\.?\s*-?\s*REG|COMPANY\s*(REG|NO)", re.IGNORECASE)
 
 
-def find_address(lines, company_idx, max_lines=5):
+def find_address(lines, company_idx, max_lines=5, max_skip=3):
     """Lines under the company name, until a phone/GST/date line."""
-    parts = []
+    parts, skipped = [], 0
     for line in lines[company_idx + 1:]:
-        if ADDRESS_STOP.search(line) or find_date([line]):
+        is_stop = ADDRESS_STOP.search(line) or find_date([line])
+        is_header = REG_LINE.search(line) or COMPANY_HINT.search(line)
+        if not parts and (is_stop or is_header) and skipped < max_skip:
+            skipped += 1      # reg number / 2nd name / phone line before the address starts
+            continue
+        if is_stop or is_header:
             break
-        if REG_LINE.search(line):
-            if parts:
-                break
-            continue                     # registration number right under the name
         parts.append(line)
         if len(parts) == max_lines:
             break
